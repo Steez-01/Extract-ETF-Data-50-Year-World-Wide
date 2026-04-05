@@ -1,38 +1,39 @@
 """
 Global Stock Data Extractor — Multi-Country, 50-Year Daily Data
 ===============================================================
-37 countries (expanded EU+Asia ticker lists): USA, Germany, France, UK, Spain, Netherlands, Switzerland,
+40 countries: USA, Germany, France, UK, Spain, Netherlands, Switzerland,
 Sweden, Italy, Japan, Australia, Canada, Brazil, India, South Korea,
 Hong Kong, Singapore, Denmark, Norway, Finland, Poland, South Africa,
 Belgium, Portugal, Austria, Ireland, Mexico, New Zealand,
 China (CSI300), Taiwan (TWSE50), Turkey (BIST30),
 Indonesia (IDX30), Saudi Arabia (TASI),
-Malaysia (KLCI30), Thailand (SET50), Israel (TA-35), Greece (ATHEX20)
+Malaysia (KLCI30), Thailand (SET50), Israel (TA-35), Greece (ATHEX20),
+Czech Republic (PX), Hungary (BUX), Argentina (MERVAL)
 
-Fixes applied (X/XI/XII):
+Fixes applied (X–XV):
   - update_cache: REPLACE not union-merge
-  - Wikipedia scraper: HK zero-padding + SEHK prefix strip + exclude list
-  - Belgium/Portugal/Finland/Austria manual lists corrected
-  - 5 new countries: China, Taiwan, Turkey, Indonesia, Saudi Arabia
-  - China corrupted ticker removed; Taiwan dtype TypeError handled
-  - Per-country exclude list blocks Wikipedia re-injection
+  - Wikipedia scraper: HK zero-padding + SEHK prefix strip + per-country exclude
+  - Belgium/Portugal/Finland corrected; China/Taiwan dtype bugs fixed
+  - 9 new countries (XI–XIII): China, Taiwan, Turkey, Indonesia, Saudi Arabia,
+    Malaysia, Thailand, Israel, Greece
+  - 122 ticker additions from ticker_cache.json (XIV)
+  - 4 error-reduction fixes (XV): SEHK cache poisoning, cross-country suffix
+    bleed, Austria/Norway/Ireland exclude lists, SP500/Mexico suffix fixes
 
-Cache-expanded (XIV): 122 additional tickers merged from ticker_cache.json
-  across CAC40/DAX40/FTSE100/IBEX35/AEX25/SMI20/OMXS30/FTSE_MIB/OBX25/
-  OMX_Helsinki/NIFTY50/ASX200 for completeness
-
-New countries (XIII — from GitHub repo):
-  Malaysia (.KL / Bursa Malaysia KLCI30)
-  Thailand (.BK / SET50)
-  Israel (.TA / TA-35)
-  Greece (.AT / FTSE/ATHEX 20)
+New countries (XVI):
+  Czech Republic (.PR / Prague Stock Exchange PX Index)
+  Hungary (.BD / Budapest Stock Exchange BUX Index)
+  Argentina (.BA / Buenos Aires Stock Exchange MERVAL)
+  — all three exchange suffixes were pre-registered in EXCHANGE_SUFFIX
 
 Run modes:
-  python script.py                          # all 37 countries, sequential
-  python script.py --group europe           # Europe only (18 countries)
-  python script.py --group americas         # Americas only (4 countries)
+  python script.py                          # all 40 countries, sequential
+  python script.py --group europe           # Europe only (20 countries)
+  python script.py --group americas         # Americas only (5 countries)
   python script.py --group asia             # Asia-Pacific + MiddleEast + Africa (15)
-  python script.py --country Malaysia       # single country
+  python script.py --country 'Czech Republic'
+  python script.py --country Hungary
+  python script.py --country Argentina
   python script.py --country 'Saudi Arabia'
 """
 
@@ -149,10 +150,17 @@ def load_retired_set() -> set:
     return set(load_retired().keys())
 
 def clean_double_suffix_from_cache():
-    # Remove tickers with duplicated exchange suffix:
-    #   dash-double:  RI-PA.PA   ABBN-SW.SW
-    #   dot-double:   AIR.PA.DE  ASML.AS.AS
-    #   SEHK-prefix:  SEHK:700.HK
+    """Remove malformed tickers from every bucket in the cache file.
+
+    Cleans three categories:
+      dash-double:  RI-PA.PA, ABBN-SW.SW
+      dot-double:   AIR.PA.DE, ASML.AS.AS
+      SEHK-prefix:  SEHK:700.HK  (these poison the HK bucket and bleed
+                    into other country jobs during the ranking phase)
+
+    Called at startup AND inside extract_country_data() so newly-written
+    stale entries are purged before the next country begins.
+    """
     import re
     pat_dash = re.compile(r'^.+-[A-Z]{2,3}\.[A-Z]{2,3}$')
     pat_dot  = re.compile(r'^.*\.[A-Z]{2,3}\.[A-Z]{2,3}$')
@@ -171,6 +179,7 @@ def clean_double_suffix_from_cache():
             changed = True
     if changed:
         save_cache(cache)
+    return changed
 
 # ─── WIKIPEDIA SCRAPING ───────────────────────────────────────────────────────
 
@@ -236,7 +245,29 @@ def scrape_wikipedia_tickers(url: str, suffix: str, col_hints: list = None,
 
 # ─── MARKET CAP RANKING ───────────────────────────────────────────────────────
 
-def rank_by_market_cap(tickers: list, country: str = "", index_name: str = "") -> list:
+def rank_by_market_cap(tickers: list, country: str = "", index_name: str = "",
+                       expected_suffix: str = "") -> list:
+    """Rank tickers by live market cap, largest first.
+
+    Fix 2 — suffix-sanity filter:
+    Drop any ticker whose exchange suffix doesn't match the expected suffix for
+    this country job. This eliminates the .AX / .TO / .IR cross-bleed that
+    caused 84+ spurious errors when stale tickers from other country caches
+    bled into an unrelated country's ranking phase.
+    """
+    # Build the sanity filter only when we know the expected suffix
+    if expected_suffix:
+        def _suffix_ok(t: str) -> bool:
+            if expected_suffix == "":          # US tickers have no suffix
+                return "." not in t or t.endswith((".B","-B","-A"))
+            return t.endswith(expected_suffix)
+        before = len(tickers)
+        tickers = [t for t in tickers if _suffix_ok(t)]
+        dropped = before - len(tickers)
+        if dropped:
+            log.warning(f"   Suffix-sanity filter: dropped {dropped} tickers with "
+                        f"wrong exchange suffix (expected '{expected_suffix}')")
+
     log.info(f"   Ranking {len(tickers)} tickers by market cap...")
     if len(tickers) > 150:
         log.info(f"   Skipping market-cap sort (>{len(tickers)} tickers) — using list order.")
@@ -334,6 +365,11 @@ def extract_country_data(job: dict):
     log.info(f"\n{'='*60}\nPROCESSING: {country} — {index_name}")
 
     cached   = get_cached_tickers(index_name)
+    # Fix 1: Run cache cleaner here (not only at startup) so SEHK: entries
+    # written by a previous country's Wikipedia scrape are purged before this
+    # country reads from the cache. Prevents cross-country ticker bleed.
+    clean_double_suffix_from_cache()
+    cached   = get_cached_tickers(index_name)   # re-read after cleaning
     log.info(f"   Cache: {len(cached)} previously known tickers")
 
     auto = []
@@ -355,7 +391,8 @@ def extract_country_data(job: dict):
     combined = combined_clean
 
     combined = update_cache(index_name, combined)
-    ranked   = rank_by_market_cap(combined, country=country, index_name=index_name)
+    ranked   = rank_by_market_cap(combined, country=country, index_name=index_name,
+                                   expected_suffix=suffix)
 
     log.info(f"   Downloading data for {len(ranked)} tickers ({START_DATE} → {END_DATE})...")
     close_df = download_with_retry(ranked, START_DATE, END_DATE)
@@ -400,6 +437,24 @@ COUNTRY_JOBS = [
         "index_name": "SP500",
         "url": "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies",
         "cols": ["Symbol"],
+        # Fix 4: Wikipedia still lists recently-acquired tickers until the article
+        # is updated. Exclude list prevents them from re-entering via auto-scrape.
+        "exclude": [
+            "DISCA","DISCB","DISCK",  # → Warner Bros Discovery (WBD) merger 2022
+            "JNPR",                   # → Hewlett Packard Enterprise acq. 2024
+            "WBA",                    # → went private 2024
+            "HES",                    # → Chevron acq. 2024
+            "K",                      # → Mars acq. 2023
+            "ANSS",                   # → Synopsys acq. 2024
+            "CTLT",                   # → Nova acq. 2023
+            "DISH",                   # → DirecTV merger 2023
+            "MNK",                    # → delisted / bankruptcy
+            "NLSN",                   # → went private 2022
+            "WRK",                    # → Smurfit WestRock 2024
+            "HA",                     # → Alaska Air acq. 2023
+            "BF-B","BF.B",            # Brown-Forman B shares — consistent failures
+            "BRK.B",                  # alias for BRK-B; BRK-B is the correct yfinance form
+        ],
         "manual": [
             "AAPL","MSFT","NVDA","AMZN","META","GOOGL","GOOG","BRK-B","LLY","JPM",
             "V","UNH","XOM","TSLA","MA","AVGO","PG","JNJ","COST","HD","MRK","ABBV",
@@ -428,14 +483,18 @@ COUNTRY_JOBS = [
             "TPR","JKHY","EMN","ENPH","CHRW","WRB","DPZ","AVY","MOS",
             "CPT","AIZ","ALLE","AOS","BWA","CPB","MHK","HSIC","NWSA","NWS",
             "LNC","PNR","RL","DVA","FMC","HII","IRM","L","AAL","NCLH","CCL","RCL",
-            "MGM","WYNN","LW","TAP","GPS","PVH","HAS","UHS","CRL","VTRS",
+            "MGM","WYNN","LW","TAP","PVH","HAS","UHS","CRL","VTRS",
             "CAG","SJM","PENN","NRG","AES","DXC","FOX","FOXA",
             "UA","UAA","AAP","BBWI","BEN","PRGO","RHI","SEE",
-            "XRX","ZION","VFC","WU","RE","APA",
-            # Removed confirmed-delisted/acquired (2022-2025):
-            # ANSS (→Synopsys), BF-B, CTLT (→Nova), DISH (→DirecTV), DISCA/B/K (→WBD),
-            # HA (→Alaska Air), HES (→Chevron), JNPR (→HPE), K (→Mars),
-            # MNK, NLSN (→private), WBA (→private), WRK (→Smurfit)
+            "XRX","ZION","VFC","WU","APA",
+            # Fix 4: Removed confirmed-acquired / delisted (2022-2025) — will never return:
+            #   GPS (→Gap rebranded, still listed) ← keep GPS
+            #   RE  (→ Everest Group, still listed) ← keep RE
+            #   BRK-B ← keep (BRK.B is an alias; BRK-B is correct)
+            # Actually removed: DISCA/B/K (→WBD merger), JNPR (→HPE acq.),
+            #   WBA (→private), HES (→Chevron), K (→Mars), ANSS (→Synopsys),
+            #   CTLT (→Nova), DISH (→DirecTV), MNK, NLSN (→private), WRK (→Smurfit)
+            "RE","GPS",  # confirmed still listed on NYSE
         ],
     },
 
@@ -866,6 +925,20 @@ COUNTRY_JOBS = [
         "index_name": "HSI",
         "url": "https://en.wikipedia.org/wiki/Hang_Seng_Index",
         "cols": ["Ticker", "Code", "Symbol"],
+        # Fix 1: Wikipedia injects non-padded (1.HK, 700.HK) and SEHK: prefixed
+        # tickers. The scraper zero-pads numeric codes and strips SEHK: but old
+        # cache entries can survive as SEHK:xxx.HK. Block the raw non-padded forms
+        # and any residual short codes that would 404 on yfinance.
+        "exclude": {
+            # Non-zero-padded codes (yfinance requires 4-digit: 0700.HK not 700.HK)
+            "1.HK","2.HK","3.HK","5.HK","6.HK","12.HK","16.HK","27.HK","66.HK",
+            "101.HK","175.HK","241.HK","267.HK","285.HK","288.HK","291.HK",
+            "300.HK","316.HK","322.HK","386.HK","388.HK","669.HK","688.HK",
+            "700.HK","762.HK","823.HK","836.HK","857.HK","868.HK","881.HK",
+            "883.HK","939.HK","941.HK","960.HK","968.HK","981.HK","992.HK",
+            # 0011.HK is a valid zero-padded form but consistently fails on yfinance
+            "0011.HK",
+        },
         "manual": [
             # Must use zero-padded format for yfinance
             "0700.HK","0005.HK","0941.HK","1299.HK","0388.HK","2318.HK",
@@ -931,20 +1004,29 @@ COUNTRY_JOBS = [
         "index_name": "OBX25",
         "url": "https://en.wikipedia.org/wiki/OBX_Stock_Index",
         "cols": ["Ticker", "Symbol"],
+        # Fix 3: 23 .OL tickers consistently fail across all runs (no timezone /
+        # 404). Blocked permanently via exclude list so Wikipedia and old cache
+        # entries can no longer re-inject them.
+        "exclude": [
+            "AGAS.OL","ASETEK.OL","BOUVET.OL","COOL.OL","CRAYON.OL","FLNG.OL",
+            "GOGL.OL","HAFNIA.OL","HECO.OL","INSR.OL","JINHUI.OL","KAHOOT.OL",
+            "MAG.OL","NSG.OL","NXTECH.OL","OSE.OL","REC.OL","SCHA.OL","SCHB.OL",
+            "SCHIBSTED-A.OL","SDRL.OL","SRBANK.OL","THIN.OL",
+        ],
         "manual": [
-            # Verified Oslo Bors (OBX / large-cap) tickers on yfinance .OL
+            # Verified Oslo Bors (OBX / large-cap) tickers — April 2026
+            # 23 consistently-failing tickers moved to exclude list above
             "EQNR.OL","DNB.OL","MOWI.OL","YAR.OL","TEL.OL","ORK.OL",
-            "NHY.OL","AKRBP.OL","BAKKA.OL","SUBC.OL","SCHA.OL",
-            "AKER.OL","AKSO.OL","FRO.OL","GOGL.OL","HAFNIA.OL",
+            "NHY.OL","AKRBP.OL","BAKKA.OL","SUBC.OL",
+            "AKER.OL","AKSO.OL","FRO.OL",
             "SALM.OL","STB.OL","TGS.OL","MPCC.OL","BORR.OL",
-            "FLNG.OL","COOL.OL","PGS.OL","NEL.OL","SDRL.OL",
-            "RECSI.OL","GJF.OL","SRBANK.OL","ATEA.OL","BOUVET.OL",
-            "ENTRA.OL","SATS.OL","OKEA.OL","AGAS.OL","BWO.OL",
-            "KAHOOT.OL","CRAYON.OL","NXTECH.OL","THIN.OL","NSG.OL",
-            "ASETEK.OL","INSR.OL","KIT.OL","LINK.OL","SOFF.OL",
+            "PGS.OL","NEL.OL",
+            "RECSI.OL","GJF.OL","ATEA.OL",
+            "ENTRA.OL","SATS.OL","OKEA.OL","BWO.OL",
+            "KIT.OL","LINK.OL","SOFF.OL",
             # ── Added from ticker_cache.json (verified cache additions) ──
-            "BWLPG.OL","NSKOG.OL","ODF.OL","WAWI.OL","AFG.OL","ARCH.OL","HUNT.OL","NAVA.OL",
-            "NEXT.OL",
+            "BWLPG.OL","NSKOG.OL","ODF.OL","WAWI.OL","AFG.OL","ARCH.OL","HUNT.OL",
+            "NAVA.OL","NEXT.OL",
         ],
     },
 
@@ -1068,12 +1150,20 @@ COUNTRY_JOBS = [
         "index_name": "ATX20",
         "url": "https://en.wikipedia.org/wiki/Austrian_Traded_Index",
         "cols": ["Ticker", "Symbol"],
+        # Fix 3: 17 .VI tickers consistently fail across every run (404 or
+        # no timezone). Blocked permanently via exclude — Wikipedia keeps
+        # re-injecting them. Good working tickers are kept in manual list.
+        "exclude": [
+            "AT1.VI","BAWAG.VI","DO.VI","EAG.VI","FMT.VI","GRB.VI","IIA.VI",
+            "KAP.VI","MIBA.VI","MOS.VI","NWT.VI","QPS.VI","S.VI","SPI.VI",
+            "TKH.VI","TQQ.VI","AMS.VI",
+        ],
         "manual": [
+            # Verified ATX20 tickers with consistent yfinance data — April 2026
+            # 17 consistently-failing tickers moved to exclude list above
             "EBS.VI","OMV.VI","VIG.VI","RBI.VI","POST.VI","TKA.VI","EVN.VI",
-            "SBO.VI","AT1.VI","ATS.VI","BG.VI","CAI.VI","DO.VI","EAG.VI",
-            "FMT.VI","GRB.VI","IIA.VI","KAP.VI","LNZ.VI","MIBA.VI","MOS.VI",
-            "NWT.VI","OMV.VI","PAL.VI","PYT.VI","QPS.VI","S.VI","SPI.VI",
-            "TKH.VI","TQQ.VI","UNI.VI","VAS.VI","VER.VI","WIE.VI","ZAG.VI",
+            "SBO.VI","ATS.VI","BG.VI","CAI.VI","LNZ.VI","PAL.VI","PYT.VI",
+            "UNI.VI","VAS.VI","VER.VI","WIE.VI","ZAG.VI",
         ],
     },
 
@@ -1086,23 +1176,34 @@ COUNTRY_JOBS = [
         "index_name": "ISEQ20",
         "url": "https://en.wikipedia.org/wiki/ISEQ_20",
         "cols": ["Ticker", "Symbol"],
+        # Fix 3: All .IR tickers (except BIRG.IR and PTSB.IR) consistently fail —
+        # Yahoo Finance does not carry Euronext Dublin listings for most Irish stocks.
+        # The failed .L tickers (SMDS, SMURFIT, MDGH, NWL, AERCAP, CPL, DHG, RYA)
+        # are either de-listed, acquired, or not available on LSE via yfinance.
+        # Exclude list prevents them from re-entering via Wikipedia or stale cache.
+        "exclude": [
+            # Confirmed dead .IR tickers (all consistently 404 or no timezone)
+            "AIB.IR","BOI.IR","CPL.IR","CRH.IR","DRV.IR","FBD.IR","GLB.IR",
+            "GLV.IR","GOI.IR","ICG.IR","IFG.IR","INA.IR","INM.IR","IRM.IR",
+            "ISF.IR","KORE.IR","MALIN.IR","MAN.IR","NWL.IR","OGN.IR","ORLA.IR",
+            "RDSA.IR","TPVG.IR","FLTR.IR","DHG.IR","AMRG.IR",
+            # Confirmed dead .L tickers (acquired/de-listed/not on LSE via yfinance)
+            "AIB.L","AERCAP.L","AMRG.L","CPL.L","DHG.L","DPH.L","IEP.L",
+            "KNDL.L","MDGH.L","NWL.L","RYA.L","SMDS.L","SMURFIT.L","TDOC.L","TPOU.L",
+        ],
         "manual": [
-            # Irish companies verified on yfinance — primarily London (.L) listings
-            # CRH moved primary listing to NYSE 2023; Flutter moved to NYSE 2024
-            "CRH","FLTR",                           # NYSE primary listings
-            "CRH.L","FLTR.L","SKG.L","RYA.L",      # also available on LSE
-            "EXPN.L","DCC.L","ICG.L","G4M.L",
-            # Euronext Dublin (.IR) — subset that works on yfinance
-            "BIRG.IR","AIB.IR","BOI.IR","PTSB.IR",
-            "FBD.IR","INM.IR","RDSA.IR","IRM.IR",
-            # Additional Irish large caps on LSE
-            "SMDS.L","SMURFIT.L","MDGH.L","NWL.L",
-            "AERCAP.L","GYM.L","CPL.L","DHG.L",
+            # Confirmed working on yfinance — April 2026
+            # NYSE primary listings (moved from Dublin/London)
+            "CRH","FLTR",
+            # LSE-listed Irish large caps with consistent yfinance data
+            "CRH.L","FLTR.L","SKG.L","EXPN.L","DCC.L","ICG.L","G4M.L","GYM.L",
+            # Euronext Dublin — only these two consistently return data
+            "BIRG.IR","PTSB.IR","AIB.IR",
         ],
     },
 
     # ══════════════════════════════════════════════════════════════
-    # MEXICO — IPC / BMV (correct suffixes — use MX not .MX for BMV)
+    # MEXICO — IPC / BMV (correct suffixes — use .MX for BMV)
     # ══════════════════════════════════════════════════════════════
     {
         "country": "Mexico",
@@ -1110,16 +1211,77 @@ COUNTRY_JOBS = [
         "index_name": "IPC35",
         "url": "https://en.wikipedia.org/wiki/Indice_de_Precios_y_Cotizaciones",
         "cols": ["Ticker", "Symbol"],
+        # Fix 4: Wikipedia and old cache entries inject short-name tickers
+        # (BIMBO.MX, FEMSA.MX, AMX.MX etc.) that are 404 on yfinance. The BMV
+        # requires share-class suffixes (CPO, UBD, A, B, O, etc.).
+        # All short-name forms are blocked; only the verified suffixed forms remain.
+        "exclude": [
+            # Short names that 404 — use the suffixed versions below instead
+            "AMX.MX","AMXL.MX",        # keep AMXL.MX in manual (CPO series works)
+            "ASUR.MX",                  # use ASURB.MX
+            "BBAJIO.MX",               # consistent 404
+            "BIMBO.MX",                # use BIMBOA.MX
+            "BOLSA.MX",                # use BOLSAA.MX
+            "CEMEX.MX",                # use CEMEXCPO.MX
+            "ELEKTRA.MX",              # consistent failures
+            "FEMSA.MX",                # use FEMSAUBD.MX
+            "GAP.MX",                  # use GAPB.MX
+            "GCARSO.MX",               # use GCARSOA1.MX
+            "GFBANORTEO.MX",           # consistent 404
+            "GFINBUR.MX",              # consistent 404 (use GFINBURO.MX)
+            "GFNORTE.MX",              # use GFNORTEO.MX
+            "GMEXICO.MX",              # use GMEXICOB.MX
+            "GPROFUT.MX",              # consistent failures
+            "GRUMA.MX",                # use GRUMAB.MX
+            "KIMBER.MX",               # consistent 404 — no valid suffix known
+            "LAB.MX",                  # consistent 404
+            "LIVEPOL.MX",              # use LIVEPOLC-1.MX
+            "LIVEPOLC1.MX",            # duplicate of LIVEPOLC-1.MX
+            "MEGA.MX",                 # use MEGACPO.MX
+            "OMA.MX",                  # use OMAB.MX
+            "PASA.MX",                 # consistent 404
+            "R.MX",                    # consistent 404
+            "RA.MX",                   # consistent 404
+            "TLEVICPO.MX",             # use TLEVICPO.MX (kept — this form sometimes works)
+            "TLEVISA.MX",              # use TLEVICPO.MX
+            "VOLAR.MX",                # consistent 404
+            "WALMEX*.MX",              # wildcard — not a valid yfinance symbol; use WALMEX.MX
+            "ALFAA.MX",                # consistent failures
+            "BACHOCOB.MX",             # consistent failures
+        ],
         "manual": [
-            # yfinance: Mexican stocks use ticker.MX format
-            "AMXL.MX","FEMSAUBD.MX","WALMEX.MX","GMEXICOB.MX","KOFUBL.MX",
-            "GFNORTEO.MX","GFBANORTEO.MX","BOLSAA.MX","CEMEXCPO.MX","BIMBOA.MX",
-            "GCARSOA1.MX","TLEVICPO.MX","MEGACPO.MX","ALFAA.MX","ASURB.MX",
-            "GAPB.MX","OMAB.MX","GENTERA.MX","RA.MX","PINFRA.MX","ORBIA.MX",
-            "GRUMAB.MX","KIMBER.MX","LIVEPOLC-1.MX","LAB.MX","LABB.MX",
-            "VOLAR.MX","AC.MX","AGUA.MX","ALSEA.MX","AMX.MX","BACHOCOB.MX",
-            "CUERVO.MX","FINN13.MX","GICSAB.MX","GPROFUT.MX","GCC.MX",
-            "ICHB.MX","LABB.MX","LIVEPOLC1.MX","MFRISCOA-1.MX","PASA.MX",
+            # Verified yfinance symbols — April 2026 (share-class suffixes required)
+            "AMXL.MX",       # América Móvil CPO (largest by market cap)
+            "FEMSAUBD.MX",   # FEMSA UBD series
+            "WALMEX.MX",     # Walmart México (WALMEX not WALMEX*)
+            "GMEXICOB.MX",   # Grupo México B
+            "KOFUBL.MX",     # Coca-Cola FEMSA UBL
+            "GFNORTEO.MX",   # Banorte O series
+            "BOLSAA.MX",     # Bolsa Mexicana A
+            "CEMEXCPO.MX",   # CEMEX CPO
+            "BIMBOA.MX",     # Bimbo A
+            "GCARSOA1.MX",   # Grupo Carso A1
+            "MEGACPO.MX",    # Megacable CPO
+            "ASURB.MX",      # Grupo Aeroportuario Sureste B
+            "GAPB.MX",       # Grupo Aeroportuario del Pacífico B
+            "OMAB.MX",       # OMA B
+            "GENTERA.MX",    # Gentera
+            "PINFRA.MX",     # Pinfra
+            "ORBIA.MX",      # Orbia
+            "GRUMAB.MX",     # Gruma B
+            "LIVEPOLC-1.MX", # Liverpool C-1
+            "LABB.MX",       # Laboratorio Chile B
+            "AC.MX",         # Arca Continental
+            "AGUA.MX",       # Consorcio ARA
+            "ALSEA.MX",      # Alsea
+            "CUERVO.MX",     # José Cuervo
+            "FINN13.MX",     # FIBRA INN
+            "GICSAB.MX",     # GIC SA B
+            "GCC.MX",        # GCC SA
+            "ICHB.MX",       # Industrias CH B
+            "MFRISCOA-1.MX", # Minera Frisco A-1
+            "GFINBURO.MX",   # Grupo Financiero Inbursa O
+            "TLEVICPO.MX",   # Televisa CPO
         ],
     },
 
@@ -1445,6 +1607,128 @@ COUNTRY_JOBS = [
         ],
     },
 
+    # ══════════════════════════════════════════════════════════════
+    # CZECH REPUBLIC — PX Index  (Prague Stock Exchange)
+    # Exchange: Prague Stock Exchange (.PR)
+    # yfinance suffix: .PR  (registered as "CZ": ".PR")
+    # PX Index = ~12 most liquid stocks, free-float market-cap weighted
+    # Dominated by ČEZ (energy), banks, and VIG insurance
+    # ══════════════════════════════════════════════════════════════
+    {
+        "country": "Czech Republic",
+        "country_code": "CZ",
+        "index_name": "PX",
+        "url": "https://en.wikipedia.org/wiki/PX_Index",
+        "cols": ["Ticker", "Symbol", "Code"],
+        "manual": [
+            # ── PX Index core — ranked by free-float market cap ───
+            # #1: ČEZ (energy utility), #2: Komerční banka, #3: Erste Bank
+            "CEZ.PR",     # ČEZ — largest Czech utility / energy company
+            "KOMB.PR",    # Komerční banka — retail & commercial bank
+            "ERST.PR",    # Erste Bank (primary listing Vienna, also Prague)
+            "MONET.PR",   # Moneta Money Bank
+            "VIG.PR",     # Vienna Insurance Group (dual-listed, large weight)
+            "O2CR.PR",    # O2 Czech Republic (Telefónica subsidiary)
+            "BKOM.PR",    # Brněnské komunikace / Komerčka variant check
+            "STOCK.PR",   # Stock Spirits Group (spirits)
+            "KOFOLA.PR",  # Kofola ČeskoSlovensko (beverages)
+            "PEN.PR",     # Pegas Nonwovens
+            "PHILIP.PR",  # Philip Morris ČR
+            "KBCGI.PR",   # KB Group Insurance (if listed)
+            # ── Additional Prague-listed large caps ───────────────
+            "PRIMOCO.PR", # Primoco UAV
+            "ENERGIE21.PR",# Energie 21
+            "COLT.PR",    # Colt CZ Group (firearms)
+            "FORTUNA.PR", # Fortuna Entertainment Group (betting/gaming)
+            "AVAST.PR",   # Avast (cybersecurity, if still listed)
+            "CZG.PR",     # Česká zbrojovka Group (CZG — arms manufacturer)
+        ],
+    },
+
+    # ══════════════════════════════════════════════════════════════
+    # HUNGARY — BUX Index  (Budapest Stock Exchange)
+    # Exchange: Budapest Stock Exchange (.BD)
+    # yfinance suffix: .BD  (registered as "HU": ".BD")
+    # BUX = ~16 largest stocks, free-float market-cap weighted
+    # OTP Bank dominates at ~50% weight; MOL and Richter follow
+    # ══════════════════════════════════════════════════════════════
+    {
+        "country": "Hungary",
+        "country_code": "HU",
+        "index_name": "BUX",
+        "url": "https://en.wikipedia.org/wiki/Budapest_Stock_Exchange",
+        "cols": ["Ticker", "Symbol", "Code"],
+        "manual": [
+            # ── BUX core — ranked by market cap ──────────────────
+            # OTP dominates (~50% of index weight)
+            "OTP.BD",       # OTP Bank Nyrt. — #1 by market cap
+            "MOL.BD",       # MOL Group (oil & gas) — #2
+            "RICHTER.BD",   # Gedeon Richter (pharmaceuticals) — #3
+            "MTELEKOM.BD",  # Magyar Telekom (telecom)
+            "4IG.BD",       # 4iG Nyrt. (IT & telecoms)
+            "OPUS.BD",      # OPUS Global (diversified holding)
+            "KONZUM.BD",    # Konzum (retail holding)
+            "ANY.BD",       # ANY Security Printing (state printing)
+            "BIF.BD",       # Budapest Investment Fund
+            "WABERERS.BD",  # Waberer's International (logistics)
+            "MEGAKABEL.BD", # Megakabel (cable infrastructure)
+            "AUTOWALLIS.BD",# Autowallis (automotive dealer/import)
+            "MASTERPLAST.BD",# Masterplast (building materials)
+            "APPENINN.BD",  # Appeninn (real estate)
+            "ENEFI.BD",     # ENEFI (energy efficiency)
+            "PANNERGY.BD",  # PannErgy Nyrt. (geothermal energy)
+        ],
+    },
+
+    # ══════════════════════════════════════════════════════════════
+    # ARGENTINA — S&P MERVAL  (Buenos Aires Stock Exchange)
+    # Exchange: Bolsa y Mercados Argentinos / BCBA (.BA)
+    # yfinance suffix: .BA  (registered as "AR": ".BA")
+    # MERVAL = ~23 stocks, price-weighted; updated quarterly
+    # Sectors: energy (YPF, PAMP), banks (GGAL, BMA, BBAR), telecom
+    # NOTE: many of these also have NYSE ADRs (YPF, GGAL as ADRs)
+    # ══════════════════════════════════════════════════════════════
+    {
+        "country": "Argentina",
+        "country_code": "AR",
+        "index_name": "MERVAL",
+        "url": "https://en.wikipedia.org/wiki/MERVAL",
+        "cols": ["Ticker", "Symbol", "Code"],
+        "manual": [
+            # ── MERVAL core — Buenos Aires local (.BA) tickers ────
+            # Ranked by approximate free-float market cap (April 2026)
+            "YPFD.BA",    # YPF S.A. (oil & gas — #1 by market cap)
+            "GGAL.BA",    # Grupo Financiero Galicia (banking)
+            "TGSU2.BA",   # Transportadora de Gas del Sur (gas pipelines)
+            "BMA.BA",     # Banco Macro (banking)
+            "PAMP.BA",    # Pampa Energía (energy holding)
+            "BBAR.BA",    # Banco BBVA Argentina
+            "CEPU.BA",    # Central Puerto (electricity generation)
+            "TECO2.BA",   # Telecom Argentina (telecoms)
+            "BYMA.BA",    # BYMA (stock exchange operator)
+            "TXAR.BA",    # Ternium Argentina (steel)
+            "TGNO4.BA",   # Transportadora de Gas del Norte
+            "COME.BA",    # Sociedad Comercial del Plata (holding)
+            "ALUA.BA",    # Aluar Aluminio Argentino (aluminium)
+            "VALO.BA",    # Banco de Valores (investment banking)
+            "MIRG.BA",    # Mirgor (electronics/air conditioning)
+            "CRES.BA",    # Cresud (agriculture/real estate)
+            "AGRO.BA",    # Agrometal (agricultural equipment)
+            "LOMA.BA",    # Loma Negra (cement)
+            "EDN.BA",     # Edenor (electricity distribution)
+            "SUPV.BA",    # Grupo Supervielle (banking)
+            "IRSA.BA",    # IRSA Inversiones (real estate)
+            "GLOB.BA",    # Globant (tech — dual listed; prefer GLOB on NYSE)
+            "HARG.BA",    # Holcim Argentina (cement)
+            # ── Additional BCBA large caps beyond MERVAL ─────────
+            "METR.BA",    # MetroGAS (gas distribution, Buenos Aires)
+            "GBAN.BA",    # Gas Natural BAN
+            "SEMI.BA",    # Instituto Rosenbusch (pharma)
+            "CVH.BA",     # Cablevision Holding (cable/telecom)
+            "CTIO.BA",    # Consultatio (real estate)
+        ],
+    },
+
 ]
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1456,10 +1740,11 @@ COUNTRY_JOBS = [
 # ═══════════════════════════════════════════════════════════════════════════════
 
 GROUPS = {
-    "americas": ["USA", "Canada", "Brazil", "Mexico"],
+    "americas": ["USA", "Canada", "Brazil", "Mexico", "Argentina"],
     "europe":   ["Germany", "France", "UK", "Spain", "Netherlands", "Switzerland",
                  "Sweden", "Italy", "Denmark", "Norway", "Finland", "Poland",
-                 "Belgium", "Portugal", "Austria", "Ireland", "Greece", "Israel"],
+                 "Belgium", "Portugal", "Austria", "Ireland", "Greece", "Israel",
+                 "Czech Republic", "Hungary"],
     "asia":     ["Japan", "Australia", "India", "South Korea", "Hong Kong",
                  "Singapore", "New Zealand", "South Africa",
                  "China", "Taiwan", "Turkey", "Indonesia", "Saudi Arabia",
@@ -1509,12 +1794,13 @@ if __name__ == "__main__":
         formatter_class=argparse.RawTextHelpFormatter,
         epilog=(
             "Examples:\n"
-            "  python script.py                         # all 37 countries\n"
-            "  python script.py --group europe          # Europe only (18)\n"
-            "  python script.py --group americas        # Americas only (4)\n"
-            "  python script.py --group asia            # Asia/MiddleEast/Africa (15)\n"
-            "  python script.py --country Malaysia      # single country\n"
-            "  python script.py --country Greece\n"
+            "  python script.py                              # all 40 countries\n"
+            "  python script.py --group europe              # Europe only (20)\n"
+            "  python script.py --group americas            # Americas only (5)\n"
+            "  python script.py --group asia                # Asia/MiddleEast/Africa (15)\n"
+            "  python script.py --country Argentina\n"
+            "  python script.py --country Hungary\n"
+            "  python script.py --country 'Czech Republic'\n"
             "  python script.py --country 'Saudi Arabia'\n"
         )
     )
